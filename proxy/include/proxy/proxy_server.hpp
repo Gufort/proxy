@@ -632,6 +632,12 @@ R"x*x*x(<html>
 		// - 默认不启用，建议仅在明确存在分析/干扰风险时开启。
 		bool scramble_{ false };
 
+		// WebSocket 单帧最大 payload 大小（单位：字节）。
+		//
+		// - 默认 64 KiB。
+		// - 这里只限制单个 frame，不限制由多个 continuation frame 组成的完整 message。
+		uint64_t websocket_max_frame_size_{ 65536 };
+
 		// 噪声注入的最大长度（单位：字节）。
 		//
 		// - 允许范围：[16, 64K]。
@@ -2842,6 +2848,473 @@ R"x*x*x(<html>
 			co_return true;
 		}
 
+		enum class websocket_peer_role
+		{
+			client,
+			server
+		};
+
+		enum class websocket_frame_error
+		{
+			none,
+			io,
+			protocol,
+			message_too_big
+		};
+
+		struct websocket_frame_header
+		{
+			bool fin{ false };
+			bool masked{ false };
+			uint8_t opcode{ 0 };
+			uint64_t payload_length{ 0 };
+			std::array<uint8_t, 4> masking_key{};
+			std::vector<uint8_t> raw;
+		};
+
+		struct websocket_fragment_state
+		{
+			bool active{ false };
+			uint8_t opcode{ 0 };
+		};
+
+		static constexpr uint8_t websocket_opcode_continuation = 0x0;
+		static constexpr uint8_t websocket_opcode_text = 0x1;
+		static constexpr uint8_t websocket_opcode_binary = 0x2;
+		static constexpr uint8_t websocket_opcode_close = 0x8;
+		static constexpr uint8_t websocket_opcode_ping = 0x9;
+		static constexpr uint8_t websocket_opcode_pong = 0xA;
+
+		static constexpr uint16_t websocket_close_protocol_error = 1002;
+		static constexpr uint16_t websocket_close_message_too_big = 1009;
+
+		template<typename DynamicBuffer>
+		inline net::awaitable<bool>
+		read_exact_with_buffer(
+			variant_stream_type& from,
+			DynamicBuffer& prebuffer,
+			void* data,
+			size_t size,
+			std::string_view context) noexcept
+		{
+			auto out = static_cast<char*>(data);
+			size_t copied = 0;
+
+			while (copied < size && prebuffer.size() > 0)
+			{
+				auto bytes = std::min(size - copied, net::buffer_size(prebuffer.data()));
+				auto copied_now = net::buffer_copy(
+					net::buffer(out + copied, bytes),
+					prebuffer.data());
+				prebuffer.consume(copied_now);
+				copied += copied_now;
+			}
+
+			if (copied == size)
+				co_return true;
+
+			boost::system::error_code ec;
+			co_await net::async_read(
+				from,
+				net::buffer(out + copied, size - copied),
+				net::transfer_exactly(size - copied),
+				net_awaitable[ec]);
+			if (ec)
+			{
+				log_conn_warning()
+					<< ", websocket " << context
+					<< " async_read: "
+					<< ec.message();
+				co_return false;
+			}
+
+			co_return true;
+		}
+
+		template<typename DynamicBuffer>
+		inline net::awaitable<websocket_frame_error>
+		read_websocket_frame_header(
+			variant_stream_type& from,
+			DynamicBuffer& prebuffer,
+			websocket_frame_header& header,
+			std::string_view context) noexcept
+		{
+			std::array<uint8_t, 2> base{};
+			if (!co_await read_exact_with_buffer(from, prebuffer, base.data(), base.size(), context))
+				co_return websocket_frame_error::io;
+
+			header = {};
+			header.raw.insert(header.raw.end(), base.begin(), base.end());
+			header.fin = (base[0] & 0x80) != 0;
+			header.opcode = base[0] & 0x0f;
+			header.masked = (base[1] & 0x80) != 0;
+
+			auto payload_code = base[1] & 0x7f;
+			if (payload_code < 126)
+			{
+				header.payload_length = payload_code;
+			}
+			else if (payload_code == 126)
+			{
+				std::array<uint8_t, 2> ext{};
+				if (!co_await read_exact_with_buffer(from, prebuffer, ext.data(), ext.size(), context))
+					co_return websocket_frame_error::io;
+
+				header.raw.insert(header.raw.end(), ext.begin(), ext.end());
+				header.payload_length =
+					(static_cast<uint64_t>(ext[0]) << 8) |
+					static_cast<uint64_t>(ext[1]);
+				if (header.payload_length < 126)
+					co_return websocket_frame_error::protocol;
+			}
+			else
+			{
+				std::array<uint8_t, 8> ext{};
+				if (!co_await read_exact_with_buffer(from, prebuffer, ext.data(), ext.size(), context))
+					co_return websocket_frame_error::io;
+
+				header.raw.insert(header.raw.end(), ext.begin(), ext.end());
+				if ((ext[0] & 0x80) != 0)
+					co_return websocket_frame_error::protocol;
+
+				uint64_t length = 0;
+				for (auto b : ext)
+					length = (length << 8) | static_cast<uint64_t>(b);
+
+				header.payload_length = length;
+				if (header.payload_length <= 0xffff)
+					co_return websocket_frame_error::protocol;
+			}
+
+			if (header.masked)
+			{
+				if (!co_await read_exact_with_buffer(
+					from,
+					prebuffer,
+					header.masking_key.data(),
+					header.masking_key.size(),
+					context))
+					co_return websocket_frame_error::io;
+
+				header.raw.insert(
+					header.raw.end(),
+					header.masking_key.begin(),
+					header.masking_key.end());
+			}
+
+			co_return websocket_frame_error::none;
+		}
+
+		inline websocket_frame_error
+		validate_websocket_frame_header(
+			const websocket_frame_header& header,
+			websocket_peer_role from_role,
+			websocket_fragment_state& fragment) const noexcept
+		{
+			if (from_role == websocket_peer_role::client && !header.masked)
+				return websocket_frame_error::protocol;
+			if (from_role == websocket_peer_role::server && header.masked)
+				return websocket_frame_error::protocol;
+
+			const bool control_frame = (header.opcode & 0x08) != 0;
+			const bool data_frame =
+				header.opcode == websocket_opcode_text ||
+				header.opcode == websocket_opcode_binary;
+
+			if (!control_frame && !data_frame &&
+				header.opcode != websocket_opcode_continuation)
+				return websocket_frame_error::protocol;
+
+			if (control_frame)
+			{
+				if (header.opcode != websocket_opcode_close &&
+					header.opcode != websocket_opcode_ping &&
+					header.opcode != websocket_opcode_pong)
+					return websocket_frame_error::protocol;
+				if (!header.fin || header.payload_length > 125)
+					return websocket_frame_error::protocol;
+				if (header.opcode == websocket_opcode_close &&
+					header.payload_length == 1)
+					return websocket_frame_error::protocol;
+			}
+			else if (header.opcode == websocket_opcode_continuation)
+			{
+				if (!fragment.active)
+					return websocket_frame_error::protocol;
+				if (header.fin)
+				{
+					fragment.active = false;
+					fragment.opcode = 0;
+				}
+			}
+			else
+			{
+				if (fragment.active)
+					return websocket_frame_error::protocol;
+				if (!header.fin)
+				{
+					fragment.active = true;
+					fragment.opcode = header.opcode;
+				}
+			}
+
+			if (header.payload_length > m_option.websocket_max_frame_size_)
+				return websocket_frame_error::message_too_big;
+
+			return websocket_frame_error::none;
+		}
+
+		inline std::vector<uint8_t>
+		make_websocket_close_frame(uint16_t code, bool mask) const
+		{
+			std::vector<uint8_t> frame;
+			frame.reserve(mask ? 8 : 4);
+			frame.push_back(0x80 | websocket_opcode_close);
+			frame.push_back(static_cast<uint8_t>((mask ? 0x80 : 0x00) | 2));
+
+			std::array<uint8_t, 2> payload{
+				static_cast<uint8_t>((code >> 8) & 0xff),
+				static_cast<uint8_t>(code & 0xff)
+			};
+
+			if (mask)
+			{
+				auto seed = static_cast<uint32_t>(
+					std::chrono::steady_clock::now().time_since_epoch().count() ^
+					static_cast<int64_t>(m_connection_id));
+				std::array<uint8_t, 4> key{
+					static_cast<uint8_t>((seed >> 24) & 0xff),
+					static_cast<uint8_t>((seed >> 16) & 0xff),
+					static_cast<uint8_t>((seed >> 8) & 0xff),
+					static_cast<uint8_t>(seed & 0xff)
+				};
+
+				frame.insert(frame.end(), key.begin(), key.end());
+				for (size_t i = 0; i < payload.size(); i++)
+					frame.push_back(payload[i] ^ key[i % key.size()]);
+			}
+			else
+			{
+				frame.insert(frame.end(), payload.begin(), payload.end());
+			}
+
+			return frame;
+		}
+
+		inline net::awaitable<void>
+		send_websocket_close_frame(
+			variant_stream_type& to,
+			uint16_t code,
+			bool mask,
+			std::string_view context) noexcept
+		{
+			boost::system::error_code ec;
+			auto frame = make_websocket_close_frame(code, mask);
+			co_await net::async_write(
+				to,
+				net::buffer(frame),
+				net_awaitable[ec]);
+			if (ec && ec != net::error::eof)
+			{
+				log_conn_warning()
+					<< ", websocket " << context
+					<< " close async_write: "
+					<< ec.message();
+			}
+		}
+
+		inline net::awaitable<void>
+		close_websocket_peers(uint16_t code) noexcept
+		{
+			if (m_local_socket.is_open())
+				co_await send_websocket_close_frame(
+					m_local_socket,
+					code,
+					false,
+					"client");
+
+			if (m_remote_socket.is_open())
+				co_await send_websocket_close_frame(
+					m_remote_socket,
+					code,
+					true,
+					"upstream");
+
+			boost::system::error_code ec;
+			co_await async_shutdown(m_local_socket, net_awaitable[ec]);
+			ec.clear();
+			co_await async_shutdown(m_remote_socket, net_awaitable[ec]);
+		}
+
+		inline uint16_t websocket_close_code(websocket_frame_error error) const noexcept
+		{
+			if (error == websocket_frame_error::message_too_big)
+				return websocket_close_message_too_big;
+			return websocket_close_protocol_error;
+		}
+
+		template<typename DynamicBuffer>
+		inline net::awaitable<bool>
+		relay_websocket_payload(
+			variant_stream_type& from,
+			variant_stream_type& to,
+			DynamicBuffer& prebuffer,
+			uint64_t payload_length,
+			size_t& bytes_transferred,
+			std::string_view context) noexcept
+		{
+			constexpr size_t max_chunk_size = 64 * 1024;
+			std::vector<char> chunk(max_chunk_size);
+
+			while (payload_length > 0 && !m_abort)
+			{
+				auto chunk_size = static_cast<size_t>(
+					std::min<uint64_t>(payload_length, chunk.size()));
+
+				if (!co_await read_exact_with_buffer(
+					from,
+					prebuffer,
+					chunk.data(),
+					chunk_size,
+					context))
+					co_return false;
+
+				boost::system::error_code ec;
+				co_await net::async_write(
+					to,
+					net::buffer(chunk.data(), chunk_size),
+					net_awaitable[ec]);
+				if (ec)
+				{
+					log_conn_warning()
+						<< ", websocket " << context
+						<< " payload async_write: "
+						<< ec.message();
+					co_return false;
+				}
+
+				payload_length -= chunk_size;
+				bytes_transferred += chunk_size;
+			}
+
+			co_return true;
+		}
+
+		template<typename DynamicBuffer>
+		inline net::awaitable<void>
+		websocket_transfer(
+			variant_stream_type& from,
+			variant_stream_type& to,
+			DynamicBuffer& prebuffer,
+			websocket_peer_role from_role,
+			size_t& bytes_transferred,
+			std::string_view context) noexcept
+		{
+			websocket_fragment_state fragment;
+
+			while (!m_abort)
+			{
+				websocket_frame_header header;
+				auto error = co_await read_websocket_frame_header(
+					from,
+					prebuffer,
+					header,
+					context);
+				if (error == websocket_frame_error::io)
+					co_return;
+
+				if (error == websocket_frame_error::none)
+					error = validate_websocket_frame_header(
+						header,
+						from_role,
+						fragment);
+
+				if (error != websocket_frame_error::none)
+				{
+					log_conn_warning()
+						<< ", websocket " << context
+						<< " invalid frame, opcode: "
+						<< static_cast<int>(header.opcode)
+						<< ", payload_length: "
+						<< header.payload_length;
+
+					co_await close_websocket_peers(websocket_close_code(error));
+					co_return;
+				}
+
+				boost::system::error_code ec;
+				co_await net::async_write(
+					to,
+					net::buffer(header.raw),
+					net_awaitable[ec]);
+				if (ec)
+				{
+					log_conn_warning()
+						<< ", websocket " << context
+						<< " header async_write: "
+						<< ec.message();
+					co_return;
+				}
+
+				bytes_transferred += header.raw.size();
+
+				if (!co_await relay_websocket_payload(
+					from,
+					to,
+					prebuffer,
+					header.payload_length,
+					bytes_transferred,
+					context))
+					co_return;
+
+				if (header.opcode == websocket_opcode_close)
+				{
+					log_conn_debug()
+						<< ", websocket " << context
+						<< " close frame relayed";
+					co_return;
+				}
+			}
+		}
+
+		template<typename LocalBuffer, typename RemoteBuffer>
+		inline net::awaitable<void>
+		websocket_concurrent_transfer(
+			LocalBuffer& local_buffer,
+			RemoteBuffer& remote_buffer) noexcept
+		{
+			size_t l2r_transferred = 0;
+			size_t r2l_transferred = 0;
+
+			stream_rate_limit(m_local_socket, m_option.tcp_rate_limit_);
+			stream_rate_limit(m_remote_socket, m_option.tcp_rate_limit_);
+
+			co_await(
+				websocket_transfer(
+					m_local_socket,
+					m_remote_socket,
+					local_buffer,
+					websocket_peer_role::client,
+					l2r_transferred,
+					"client to upstream")
+				&&
+				websocket_transfer(
+					m_remote_socket,
+					m_local_socket,
+					remote_buffer,
+					websocket_peer_role::server,
+					r2l_transferred,
+					"upstream to client")
+			);
+
+			log_conn_debug()
+				<< ", websocket transfer completed"
+				<< ", local to remote: "
+				<< l2r_transferred
+				<< ", remote to local: "
+				<< r2l_transferred;
+		}
+
 		inline net::awaitable<bool>
 		http_proxy_websocket_upgrade(string_request& req) noexcept
 		{
@@ -2856,12 +3329,6 @@ R"x*x*x(<html>
 					<< ec.message();
 				co_return false;
 			}
-
-			if (!co_await flush_buffered_data(
-				m_remote_socket,
-				m_local_buffer,
-				"websocket upgrade local buffered data"))
-				co_return false;
 
 			beast::flat_buffer remote_buffer;
 			http::response_parser<http::string_body> response_parser;
@@ -2927,16 +3394,10 @@ R"x*x*x(<html>
 				co_return false;
 			}
 
-			if (!co_await flush_buffered_data(
-				m_local_socket,
-				remote_buffer,
-				"websocket upgrade remote buffered data"))
-				co_return false;
-
 			log_conn_debug()
 				<< ", websocket upgrade established";
 
-			co_await concurrent_transfer();
+			co_await websocket_concurrent_transfer(m_local_buffer, remote_buffer);
 
 			co_return true;
 		}
