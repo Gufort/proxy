@@ -2751,6 +2751,72 @@ R"x*x*x(<html>
 			return beast::websocket::is_upgrade(req);
 		}
 
+		inline bool validate_websocket_upgrade_request(const string_request& req) const noexcept
+		{
+			if (!is_http_proxy_websocket_upgrade(req))
+				return false;
+
+			auto key = req.find(http::field::sec_websocket_key);
+			if (key == req.end() || key->value().empty())
+				return false;
+
+			auto version = req.find(http::field::sec_websocket_version);
+			if (version == req.end() || version->value().empty())
+				return false;
+			if (version->value() != "13")
+				return false;
+
+			return true;
+		}
+
+		inline net::awaitable<int> authenticate_http_proxy_request(const string_request& req) noexcept
+		{
+			co_return co_await http_authorization(req[http::field::proxy_authorization]);
+		}
+
+		inline void prepare_http_proxy_request(
+			string_request& req,
+			std::string_view host,
+			std::string_view resource) const
+		{
+			if (resource.empty())
+				req.target("/");
+			else
+				req.target(std::string(resource));
+
+			req.set(http::field::host, host);
+
+			if (req.find(http::field::connection) == req.end() &&
+				req.find(http::field::proxy_connection) != req.end())
+				req.set(http::field::connection, req[http::field::proxy_connection]);
+
+			req.erase(http::field::proxy_authorization);
+			req.erase(http::field::proxy_connection);
+		}
+
+		inline net::awaitable<void>
+		bad_websocket_upgrade_request() noexcept
+		{
+			boost::system::error_code ec;
+			auto date_string = server_date_string();
+			auto fake_page =
+				fmt::vformat(fake_400_content_fmt,
+					fmt::make_format_args(date_string));
+
+			co_await net::async_write(
+				m_local_socket,
+				net::buffer(fake_page),
+				net::transfer_all(),
+				net_awaitable[ec]);
+			if (ec)
+			{
+				log_conn_warning()
+					<< ", websocket upgrade bad request async_write: "
+					<< ec.message();
+			}
+			co_return;
+		}
+
 		template<typename DynamicBuffer>
 		inline net::awaitable<bool>
 		flush_buffered_data(variant_stream_type& to, DynamicBuffer& buffer, std::string_view context) noexcept
@@ -2932,7 +2998,7 @@ R"x*x*x(<html>
 
 				// http 代理认证, 如果请求的 rarget 不是 http url 或认证
 				// 失败, 则按正常 web 请求处理.
-				auto auth_result = co_await http_authorization(pa);
+				auto auth_result = co_await authenticate_http_proxy_request(req);
 				if (auth_result != PROXY_AUTH_SUCCESS || !get_url_proxy)
 				{
 					// 如果 doc 目录为空, 则不允许访问目录
@@ -3001,6 +3067,21 @@ R"x*x*x(<html>
 
 				// 解构 url 中的信息.
 				auto [scheme, user, passwd, host, port, resource] = *expect_url;
+				if (boost::iequals(scheme, "ws") && port == 0)
+					port = 80;
+
+				// 处理代理请求头.
+				prepare_http_proxy_request(req, host, resource);
+
+				bool websocket_upgrade = is_http_proxy_websocket_upgrade(req);
+				if (websocket_upgrade && !validate_websocket_upgrade_request(req))
+				{
+					log_conn_warning()
+						<< ", invalid websocket upgrade request";
+
+					co_await bad_websocket_upgrade_request();
+					co_return true;
+				}
 
 				if (!m_remote_socket.is_open())
 				{
@@ -3020,22 +3101,7 @@ R"x*x*x(<html>
 					}
 				}
 
-				// 处理代理请求头.
-				if (resource.empty())
-					req.target("/");
-				else
-					req.target(std::string(resource));
-
-				req.set(http::field::host, host);
-
-				if (req.find(http::field::connection) == req.end() &&
-					req.find(http::field::proxy_connection) != req.end())
-					req.set(http::field::connection, req[http::field::proxy_connection]);
-
-				req.erase(http::field::proxy_authorization);
-				req.erase(http::field::proxy_connection);
-
-				if (is_http_proxy_websocket_upgrade(req))
+				if (websocket_upgrade)
 				{
 					log_conn_debug()
 						<< ", websocket upgrade request detected";
