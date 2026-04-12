@@ -3451,6 +3451,7 @@ R"x*x*x(<html>
 
 				if (boost::istarts_with(target_view, "https://") ||
 					boost::istarts_with(target_view, "http://") ||
+					boost::istarts_with(target_view, "wss://") ||
 					boost::istarts_with(target_view, "ws://"))
 				{
 					get_url_proxy = true;
@@ -3530,6 +3531,9 @@ R"x*x*x(<html>
 				auto [scheme, user, passwd, host, port, resource] = *expect_url;
 				if (boost::iequals(scheme, "ws") && port == 0)
 					port = 80;
+				else if (boost::iequals(scheme, "wss") && port == 0)
+					port = 443;
+				bool target_use_ssl = boost::iequals(scheme, "wss");
 
 				// 处理代理请求头.
 				prepare_http_proxy_request(req, host, resource);
@@ -3547,7 +3551,12 @@ R"x*x*x(<html>
 				if (!m_remote_socket.is_open())
 				{
 					// 连接到目标主机.
-					ec = co_await start_connect_host(std::string(host), port, false);
+					ec = co_await start_connect_host(
+						std::string(host),
+						port,
+						false,
+						SOCKS_CMD_CONNECT,
+						target_use_ssl);
 					if (ec)
 					{
 						log_conn_warning()
@@ -4129,11 +4138,111 @@ R"x*x*x(<html>
 			co_return ec;
 		}
 
+		inline net::awaitable<boost::system::error_code>
+		upgrade_remote_stream_to_target_tls(const std::string& target_host) noexcept
+		{
+			boost::system::error_code ec;
+
+			if (!boost::variant2::holds_alternative<proxy_tcp_socket>(m_remote_socket))
+			{
+				log_conn_warning()
+					<< ", target TLS over an already TLS-wrapped upstream stream is not supported";
+				co_return make_error_code(boost::system::errc::operation_not_supported);
+			}
+
+			if (fs::exists(m_option.ssl_cacert_path_))
+			{
+				m_ssl_cli_context.add_verify_path(m_option.ssl_cacert_path_, ec);
+				if (ec)
+				{
+					log_conn_warning()
+						<< ", load cert path: "
+						<< m_option.ssl_cacert_path_
+						<< ", error: "
+						<< ec.message();
+					ec.clear();
+				}
+			}
+
+			m_ssl_cli_context.set_verify_mode(net::ssl::verify_peer);
+			auto certificates = default_root_certificates();
+
+			m_ssl_cli_context.add_certificate_authority(
+				net::buffer(certificates.data(), certificates.size()), ec);
+			if (ec)
+			{
+				log_conn_warning()
+					<< ", load default root cert error: "
+					<< ec.message();
+				ec.clear();
+			}
+
+			m_ssl_cli_context.use_tmp_dh(net::buffer(default_dh_param()), ec);
+			ec.clear();
+
+			SSL_CTX_set_alpn_protos(m_ssl_cli_context.native_handle(),
+				(const unsigned char *)"\x08http/1.1", 9);
+
+			m_ssl_cli_context.set_verify_callback(
+				net::ssl::host_name_verification(target_host), ec);
+			if (ec)
+			{
+				log_conn_warning()
+					<< ", set target TLS verify callback error: "
+					<< ec.message();
+				co_return ec;
+			}
+
+			auto plain_stream = std::move(
+				boost::variant2::get<proxy_tcp_socket>(m_remote_socket));
+			auto tls_stream = init_proxy_stream(std::move(plain_stream), m_ssl_cli_context);
+			auto& ssl_socket = boost::variant2::get<ssl_tcp_stream>(tls_stream);
+
+			std::string sni = m_option.proxy_ssl_name_.empty() ?
+				target_host : m_option.proxy_ssl_name_;
+			if (!SSL_set_tlsext_host_name(ssl_socket.native_handle(), sni.c_str()))
+			{
+				log_conn_warning()
+					<< ", set target TLS SNI name: "
+					<< sni
+					<< " failed, error: "
+					<< ::ERR_get_error();
+			}
+
+			log_conn_debug()
+				<< ", performing target TLS handshake with "
+				<< target_host
+				<< "...";
+
+			co_await ssl_socket.async_handshake(
+				net::ssl::stream_base::client,
+				net_awaitable[ec]);
+			if (ec)
+			{
+				log_conn_warning()
+					<< ", target TLS handshake failed with "
+					<< target_host
+					<< ", error: "
+					<< ec.message();
+				co_return ec;
+			}
+
+			m_remote_socket = std::move(tls_stream);
+
+			log_conn_debug()
+				<< ", target TLS handshake with "
+				<< target_host
+				<< " completed successfully";
+
+			co_return ec;
+		}
+
 		inline net::awaitable<boost::system::error_code> start_connect_host(
 			std::string target_host,
 			uint16_t target_port,
 			bool resolved = false,
-			int command = SOCKS_CMD_CONNECT) noexcept
+			int command = SOCKS_CMD_CONNECT,
+			bool target_use_ssl = false) noexcept
 		{
 			tcp::socket& remote_socket = net_tcp_socket(m_remote_socket);
 			tcp::resolver::results_type targets;
@@ -4153,6 +4262,9 @@ R"x*x*x(<html>
 						target_host, target_port,
 						*m_proxy_pass, command);
 				}
+
+				if (!ec && target_use_ssl)
+					ec = co_await upgrade_remote_stream_to_target_tls(target_host);
 
 				co_return ec;
 			}
@@ -4189,6 +4301,9 @@ R"x*x*x(<html>
 
 			// 重新初始化 m_remote_socket 为 variant_stream_type 类型.
 			m_remote_socket = init_proxy_stream(std::move(remote_socket));
+
+			if (target_use_ssl)
+				ec = co_await upgrade_remote_stream_to_target_tls(target_host);
 
 			co_return ec;
 		}
