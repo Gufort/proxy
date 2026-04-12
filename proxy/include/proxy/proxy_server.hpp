@@ -2746,6 +2746,135 @@ R"x*x*x(<html>
 			co_return PROXY_AUTH_SUCCESS;
 		}
 
+		inline bool is_http_proxy_websocket_upgrade(const string_request& req) const noexcept
+		{
+			return beast::websocket::is_upgrade(req);
+		}
+
+		template<typename DynamicBuffer>
+		inline net::awaitable<bool>
+		flush_buffered_data(variant_stream_type& to, DynamicBuffer& buffer, std::string_view context) noexcept
+		{
+			if (buffer.size() == 0)
+				co_return true;
+
+			boost::system::error_code ec;
+			auto bytes = co_await net::async_write(
+				to,
+				buffer.data(),
+				net_awaitable[ec]);
+			if (ec)
+			{
+				log_conn_warning()
+					<< ", " << context
+					<< " async_write: "
+					<< ec.message();
+				co_return false;
+			}
+
+			buffer.consume(bytes);
+			co_return true;
+		}
+
+		inline net::awaitable<bool>
+		http_proxy_websocket_upgrade(string_request& req) noexcept
+		{
+			boost::system::error_code ec;
+
+			co_await http::async_write(
+				m_remote_socket, req, net_awaitable[ec]);
+			if (ec)
+			{
+				log_conn_warning()
+					<< ", websocket upgrade request async_write: "
+					<< ec.message();
+				co_return false;
+			}
+
+			if (!co_await flush_buffered_data(
+				m_remote_socket,
+				m_local_buffer,
+				"websocket upgrade local buffered data"))
+				co_return false;
+
+			beast::flat_buffer remote_buffer;
+			http::response_parser<http::string_body> response_parser;
+			response_parser.body_limit(1024 * 1024 * 10);
+
+			co_await http::async_read_header(
+				m_remote_socket,
+				remote_buffer,
+				response_parser,
+				net_awaitable[ec]);
+			if (ec)
+			{
+				log_conn_warning()
+					<< ", websocket upgrade response async_read_header: "
+					<< ec.message();
+				co_return false;
+			}
+
+			auto& res = response_parser.get();
+			if (res.result() != http::status::switching_protocols)
+			{
+				if (!response_parser.is_done())
+				{
+					co_await http::async_read(
+						m_remote_socket,
+						remote_buffer,
+						response_parser,
+						net_awaitable[ec]);
+					if (ec)
+					{
+						log_conn_warning()
+							<< ", websocket upgrade response async_read: "
+							<< ec.message();
+						co_return false;
+					}
+				}
+
+				co_await http::async_write(
+					m_local_socket,
+					response_parser.release(),
+					net_awaitable[ec]);
+				if (ec)
+				{
+					log_conn_warning()
+						<< ", websocket upgrade response async_write: "
+						<< ec.message();
+					co_return false;
+				}
+
+				co_return true;
+			}
+
+			string_response_serializer serializer{ res };
+			co_await http::async_write_header(
+				m_local_socket,
+				serializer,
+				net_awaitable[ec]);
+			if (ec)
+			{
+				log_conn_warning()
+					<< ", websocket upgrade response header async_write: "
+					<< ec.message();
+				co_return false;
+			}
+
+			if (!co_await flush_buffered_data(
+				m_local_socket,
+				remote_buffer,
+				"websocket upgrade remote buffered data"))
+				co_return false;
+
+			log_conn_debug()
+				<< ", websocket upgrade established";
+
+			co_await concurrent_transfer();
+
+			co_return true;
+		}
+
 		inline net::awaitable<bool> http_proxy_get() noexcept
 		{
 			boost::system::error_code ec;
@@ -2794,7 +2923,8 @@ R"x*x*x(<html>
 				boost::system::result<url_info> expect_url;
 
 				if (boost::istarts_with(target_view, "https://") ||
-					boost::istarts_with(target_view, "http://"))
+					boost::istarts_with(target_view, "http://") ||
+					boost::istarts_with(target_view, "ws://"))
 				{
 					get_url_proxy = true;
 					expect_url = parse_urlinfo(target_view);
@@ -2904,6 +3034,14 @@ R"x*x*x(<html>
 
 				req.erase(http::field::proxy_authorization);
 				req.erase(http::field::proxy_connection);
+
+				if (is_http_proxy_websocket_upgrade(req))
+				{
+					log_conn_debug()
+						<< ", websocket upgrade request detected";
+
+					co_return co_await http_proxy_websocket_upgrade(req);
+				}
 
 				co_await http::async_write(
 					m_remote_socket, req, net_awaitable[ec]);
