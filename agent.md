@@ -468,3 +468,37 @@ Implemented details:
   - proxy route details (`ws://`, `wss://` over `CONNECT`, `proxy_pass`);
   - frame type and payload size;
   - auth and load-test details.
+
+## Next Work: Baseline Integration Tests
+
+Purpose:
+
+- Provide a defense/demo test set showing that the original proxy functionality still works after the WebSocket changes.
+- Keep these tests separate from the new WebSocket tests so the project can show:
+  - baseline/original behavior still passes;
+  - new WebSocket behavior passes.
+
+Implemented details:
+
+- Added `tests/baseline_proxy_integration.py`.
+- Added baseline CTest cases:
+  - `baseline_proxy_static_http`;
+  - `baseline_proxy_http_proxy`;
+  - `baseline_proxy_connect_tunnel`;
+  - `baseline_proxy_socks5`;
+  - `baseline_proxy_auth`;
+  - `baseline_proxy_same_port_http_socks`;
+  - aggregate `baseline_proxy_all`.
+- The baseline runner uses only Python standard library.
+- It starts real `proxy_server` subprocesses and local test servers.
+- Covered original functionality:
+  - static HTTP document serving through `http_doc`;
+  - HTTP proxy absolute-form `GET`;
+  - HTTP `CONNECT` TCP tunnel;
+  - SOCKS5 `CONNECT`;
+  - HTTP proxy authentication with `Proxy-Authorization`;
+  - protocol detection / same listen port for HTTP and SOCKS5.
+- Test output is in Russian and includes scenario names, ports, proxy routes, and payload sizes.
+- Verified locally with:
+  - `ctest --test-dir build-local --output-on-failure -V -R '^baseline_proxy_(static_http|http_proxy|connect_tunnel|socks5|auth|same_port_http_socks)$'`.
+- The baseline CTest run passed: 6/6 tests.
