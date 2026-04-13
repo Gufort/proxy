@@ -412,3 +412,59 @@ Implemented details:
 Remaining note:
 
 - This is a serialized writer gate, not a full payload-owning message queue. That is intentional: it avoids extra copying and keeps the current streaming relay model.
+
+## Next Work: WebSocket Integration Tests
+
+Requirement:
+
+- Add tests that start the real proxy server and verify WebSocket proxying end to end.
+- Cover:
+  - `ws://` through HTTP proxy;
+  - `wss://` through HTTP proxy `CONNECT`;
+  - `proxy_pass` chaining;
+  - proxy authentication during WebSocket handshake;
+  - text and binary messages with different payload sizes;
+  - fragmented messages;
+  - ping/pong forwarding;
+  - HTTP server and WebSocket proxy sharing one port;
+  - multiple concurrent WebSocket connections.
+
+Chosen test design:
+
+- Use CTest with a Python integration runner.
+- Avoid external Python dependencies; use only Python standard library.
+- The runner starts:
+  - local plain WebSocket echo server;
+  - local TLS WebSocket echo server for the `wss://`/`CONNECT` path;
+  - one or more `proxy_server` subprocesses depending on scenario.
+- WebSocket frames are encoded/decoded directly in the test so fragmentation, masking, extended lengths, ping/pong, and close behavior are explicit.
+
+Implemented details:
+
+- Added `ENABLE_BUILD_TESTS` CMake option.
+- Added `tests/CMakeLists.txt`.
+- Added `tests/websocket_proxy_integration.py`.
+- The Python runner supports `--case all` and individual cases:
+  - `ws_wss`;
+  - `proxy_pass`;
+  - `auth`;
+  - `messages`;
+  - `fragmentation`;
+  - `ping_pong`;
+  - `http_same_port`;
+  - `load`.
+- CTest registers:
+  - aggregate test `websocket_proxy_all`;
+  - one test per requirement point, named `websocket_proxy_<case>`.
+- The test uses `$<TARGET_FILE:proxy_server>` so it runs against the built proxy binary.
+- Verified locally with:
+  - `cmake -S . -B build-local -DENABLE_BUILD_TESTS=ON`;
+  - `cmake --build build-local --target proxy_server -j 2`;
+  - `ctest --test-dir build-local --output-on-failure -V -R '^websocket_proxy_(ws_wss|proxy_pass|auth|messages|fragmentation|ping_pong|http_same_port|load)$'`.
+- The per-requirement CTest run passed: 8/8 tests.
+- Test output was later expanded in Russian:
+  - scenario start/success markers;
+  - local proxy and echo-server ports;
+  - proxy route details (`ws://`, `wss://` over `CONNECT`, `proxy_pass`);
+  - frame type and payload size;
+  - auth and load-test details.

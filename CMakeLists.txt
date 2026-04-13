@@ -79,6 +79,7 @@ option(ENABLE_MIMALLOC_STATIC		"Build with mimalloc support" OFF)
 option(ENABLE_SNMALLOC_STATIC		"Build with snmalloc support" OFF)
 
 option(ENABLE_BUILD_EXAMPLES		"Build proxy examples" OFF)
+option(ENABLE_BUILD_TESTS			"Build and register proxy tests" OFF)
 option(ENABLE_LINKE_TO_LIBATOMIC	"Link to libatomic.so - some platform requires it" OFF)
 
 ################################################################################
@@ -597,6 +598,14 @@ add_subdirectory(server)
 
 if (ENABLE_BUILD_EXAMPLES)
 	add_subdirectory(example)
+endif()
+
+################################################################################
+# 添加 tests 项目
+
+if (ENABLE_BUILD_TESTS)
+	enable_testing()
+	add_subdirectory(tests)
 endif()
 
 ################################################################################
