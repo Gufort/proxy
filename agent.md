@@ -352,3 +352,63 @@ Implemented details:
 - `proxy_session::close()` now detects active WebSocket relays and spawns a best-effort graceful WebSocket shutdown with `1001` instead of immediately closing sockets.
 - The full write-serialization layer is still intentionally deferred; this implementation keeps the current transparent relay model and makes Close handling one-shot to reduce duplicate/racing Close attempts.
 - Build verification passed: `cmake --build build-local --target proxy_server -j 2`.
+
+## Technical Requirements Assessment
+
+Current WebSocket implementation against the technical requirements:
+
+- C++20 coroutines / `asio::awaitable`: satisfied. The WebSocket handshake, frame relay, timeout handling, and graceful shutdown helpers are implemented as `net::awaitable` coroutines and integrated into the existing coroutine session flow.
+- `variant_stream` / SSL support: mostly satisfied. The relay reads/writes through `variant_stream_type`, so incoming TLS and target-side `wss://` streams share the same code path. Known limitation: absolute-form `wss://` over an already TLS-wrapped upstream proxy stream is explicitly unsupported until nested TLS over the current variant stream model is added.
+- Authentication and authorization reuse: satisfied for visible HTTP proxy WebSocket Upgrade requests. `http_proxy_get()` authenticates through the existing `authenticate_http_proxy_request()` flow before connecting upstream, so `auth_users`, PAM, per-user rate limit, bind address, and per-user `proxy_pass` remain shared with regular HTTP proxying.
+- Performance / low copying: partially satisfied. The relay is streaming and does not buffer whole WebSocket messages; it parses only headers, forwards payload bytes unchanged, and handles large frames in chunks. It is not true zero-copy because payload chunks are read into a 64 KiB temporary buffer before being written onward. This is close to the existing TCP relay style but not a full zero-copy design.
+- Upstream proxy / CONNECT tunnel: mostly satisfied. WebSocket target connections reuse `start_connect_host()` and `proxy_pass_handshake()`, so configured socks/http/https upstream proxy paths are reused. HTTP/HTTPS upstream proxying establishes the target tunnel before the WebSocket handshake. Browser-style encrypted `wss://` through client `CONNECT` remains a raw tunnel and is not frame-inspected without TLS MITM.
+- Thread safety / shared data: partially satisfied. The implementation keeps per-session state local to `proxy_session` and uses one-shot WebSocket shutdown flags to avoid duplicate Close handling. However, full write serialization for relay data, ping frames, and shutdown Close frames is still deferred. This is acceptable for the current conservative implementation but should be improved before enabling active proxy-generated ping frames or more complex concurrent control-frame injection.
+
+Conclusion:
+
+- The implementation satisfies the main architectural integration requirements.
+- Remaining technical debt is concentrated in two areas:
+  - a real serialized WebSocket writer path for stronger concurrency guarantees and future ping/pong support;
+  - optional lower-copy payload forwarding if strict zero-copy performance is required.
+
+## Next Work: Serialized WebSocket Writes
+
+Goal:
+
+- Remove the remaining concurrent-write risk in the transparent WebSocket relay.
+- Make normal relay writes, Close frames, and future ping/pong control frames use one serialized write path per direction.
+- Preserve the low-copy streaming relay shape rather than buffering entire WebSocket messages into a large queue.
+
+Chosen design:
+
+- Add a lightweight per-direction write gate:
+  - one gate for writes toward the client;
+  - one gate for writes toward the upstream server.
+- Use `boost::asio::experimental::channel` only for waiters that need to sleep until the current writer releases the gate.
+- Keep payload data in the current relay buffer and write it after acquiring the gate. This serializes writes without copying every payload chunk into an explicit queue.
+- Route all WebSocket writes through `websocket_serialized_write()`:
+  - frame headers;
+  - payload chunks;
+  - Close control frames.
+
+Implemented details:
+
+- Added `websocket_write_gate` with:
+  - `locked`;
+  - FIFO waiter list.
+- Added helpers:
+  - `websocket_gate_for()`;
+  - `acquire_websocket_write()`;
+  - `release_websocket_write()`;
+  - `reset_websocket_write_gates()`;
+  - `websocket_serialized_write()`.
+- `send_websocket_close_frame()` now uses the serialized writer path.
+- WebSocket frame header forwarding now uses the serialized writer path.
+- WebSocket payload chunk forwarding now uses the serialized writer path.
+- Write gates are reset when a WebSocket `101` relay starts.
+- This provides the necessary synchronization foundation for implementing active `websocket_ping_interval` later.
+- Build verification passed: `cmake --build build-local --target proxy_server -j 2`.
+
+Remaining note:
+
+- This is a serialized writer gate, not a full payload-owning message queue. That is intentional: it avoids extra copying and keeps the current streaming relay model.

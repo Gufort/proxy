@@ -57,6 +57,7 @@
 #include <boost/asio/local/stream_protocol.hpp>
 
 #include <boost/asio/detached.hpp>
+#include <boost/asio/experimental/channel.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 
 #ifdef _MSC_VER
@@ -122,6 +123,7 @@
 #include <sstream>
 #include <string>
 #include <array>
+#include <deque>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -2889,6 +2891,15 @@ R"x*x*x(<html>
 			server
 		};
 
+		using websocket_write_waiter =
+			net::experimental::channel<void(boost::system::error_code)>;
+
+		struct websocket_write_gate
+		{
+			bool locked{ false };
+			std::deque<std::shared_ptr<websocket_write_waiter>> waiters;
+		};
+
 		enum class websocket_frame_error
 		{
 			none,
@@ -2928,6 +2939,71 @@ R"x*x*x(<html>
 		{
 			if (m_option.websocket_timeout_ > 0)
 				stream_expires_after(stream, std::chrono::seconds(m_option.websocket_timeout_));
+		}
+
+		inline websocket_write_gate&
+		websocket_gate_for(websocket_peer_role to_role) noexcept
+		{
+			return to_role == websocket_peer_role::client
+				? m_websocket_client_write_gate
+				: m_websocket_upstream_write_gate;
+		}
+
+		inline net::awaitable<void>
+		acquire_websocket_write(websocket_write_gate& gate) noexcept
+		{
+			if (!gate.locked)
+			{
+				gate.locked = true;
+				co_return;
+			}
+
+			auto waiter = std::make_shared<websocket_write_waiter>(m_executor, 1);
+			gate.waiters.push_back(waiter);
+
+			boost::system::error_code ec;
+			co_await waiter->async_receive(net_awaitable[ec]);
+		}
+
+		inline void release_websocket_write(websocket_write_gate& gate) noexcept
+		{
+			if (gate.waiters.empty())
+			{
+				gate.locked = false;
+				return;
+			}
+
+			auto waiter = gate.waiters.front();
+			gate.waiters.pop_front();
+			waiter->try_send(boost::system::error_code{});
+		}
+
+		inline void reset_websocket_write_gates() noexcept
+		{
+			m_websocket_client_write_gate = {};
+			m_websocket_upstream_write_gate = {};
+		}
+
+		inline net::awaitable<boost::system::error_code>
+		websocket_serialized_write(
+			variant_stream_type& to,
+			websocket_peer_role to_role,
+			net::const_buffer buffer,
+			[[maybe_unused]] std::string_view context) noexcept
+		{
+			auto& gate = websocket_gate_for(to_role);
+			co_await acquire_websocket_write(gate);
+
+			boost::system::error_code ec;
+			websocket_stream_expires_after(to);
+			co_await net::async_write(
+				to,
+				buffer,
+				net_awaitable[ec]);
+
+			release_websocket_write(gate);
+
+			co_return ec;
 		}
 
 		template<typename DynamicBuffer>
@@ -3147,17 +3223,17 @@ R"x*x*x(<html>
 		inline net::awaitable<void>
 		send_websocket_close_frame(
 			variant_stream_type& to,
+			websocket_peer_role to_role,
 			uint16_t code,
 			bool mask,
 			std::string_view context) noexcept
 		{
-			boost::system::error_code ec;
 			auto frame = make_websocket_close_frame(code, mask);
-			websocket_stream_expires_after(to);
-			co_await net::async_write(
+			auto ec = co_await websocket_serialized_write(
 				to,
+				to_role,
 				net::buffer(frame),
-				net_awaitable[ec]);
+				context);
 			if (ec && ec != net::error::eof)
 			{
 				log_conn_warning()
@@ -3187,6 +3263,7 @@ R"x*x*x(<html>
 			if (send_to_client && m_local_socket.is_open())
 				co_await send_websocket_close_frame(
 					m_local_socket,
+					websocket_peer_role::client,
 					code,
 					false,
 					"client");
@@ -3194,6 +3271,7 @@ R"x*x*x(<html>
 			if (send_to_upstream && m_remote_socket.is_open())
 				co_await send_websocket_close_frame(
 					m_remote_socket,
+					websocket_peer_role::server,
 					code,
 					true,
 					"upstream");
@@ -3254,12 +3332,14 @@ R"x*x*x(<html>
 					co_return false;
 				}
 
-				boost::system::error_code ec;
-				websocket_stream_expires_after(to);
-				co_await net::async_write(
+				const auto to_role = from_role == websocket_peer_role::client
+					? websocket_peer_role::server
+					: websocket_peer_role::client;
+				auto ec = co_await websocket_serialized_write(
 					to,
+					to_role,
 					net::buffer(chunk.data(), chunk_size),
-					net_awaitable[ec]);
+					context);
 				if (ec)
 				{
 					log_conn_warning()
@@ -3338,12 +3418,14 @@ R"x*x*x(<html>
 					co_return;
 				}
 
-				boost::system::error_code ec;
-				websocket_stream_expires_after(to);
-				co_await net::async_write(
+				const auto to_role = from_role == websocket_peer_role::client
+					? websocket_peer_role::server
+					: websocket_peer_role::client;
+				auto ec = co_await websocket_serialized_write(
 					to,
+					to_role,
 					net::buffer(header.raw),
-					net_awaitable[ec]);
+					context);
 				if (ec)
 				{
 					log_conn_warning()
@@ -3504,6 +3586,7 @@ R"x*x*x(<html>
 
 			m_websocket_active = true;
 			m_websocket_close_started = false;
+			reset_websocket_write_gates();
 
 			co_await websocket_concurrent_transfer(m_local_buffer, remote_buffer);
 
@@ -5997,6 +6080,8 @@ R"x*x*x(<html>
 		// WebSocket relay state for graceful close/error handling.
 		bool m_websocket_active{ false };
 		bool m_websocket_close_started{ false };
+		websocket_write_gate m_websocket_client_write_gate;
+		websocket_write_gate m_websocket_upstream_write_gate;
 	};
 
 
