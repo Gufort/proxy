@@ -616,6 +616,12 @@ R"x*x*x(<html>
 		// - false：提供 UDP 相关服务。
 		bool disable_udp_{ false };
 
+		// 是否禁用 WebSocket Upgrade 代理支持。
+		//
+		// - true ：HTTP 代理路径中识别到 WebSocket Upgrade 时直接拒绝。
+		// - false：允许 WebSocket Upgrade 并进入 frame-aware relay。
+		bool disable_websocket_{ false };
+
 		// 是否启用“噪声注入 / 混淆”（scramble）以干扰流量分析。
 		//
 		// 生效条件：
@@ -637,6 +643,19 @@ R"x*x*x(<html>
 		// - 默认 64 KiB。
 		// - 这里只限制单个 frame，不限制由多个 continuation frame 组成的完整 message。
 		uint64_t websocket_max_frame_size_{ 65536 };
+
+		// WebSocket ping 间隔（秒）。
+		//
+		// - 默认 30 秒。
+		// - 目前仅作为配置项保留；主动注入 ping 需要统一写入串行化后再启用。
+		// - 0 表示不发送代理主动 ping。
+		int websocket_ping_interval_{ 30 };
+
+		// WebSocket 空闲超时时间（秒）。
+		//
+		// - <= 0 表示不启用 WebSocket 专属超时，保持既有行为。
+		// - > 0 时在 frame 读取/写入前刷新底层 stream expiry。
+		int websocket_timeout_{ -1 };
 
 		// 噪声注入的最大长度（单位：字节）。
 		//
@@ -2888,6 +2907,12 @@ R"x*x*x(<html>
 		static constexpr uint16_t websocket_close_protocol_error = 1002;
 		static constexpr uint16_t websocket_close_message_too_big = 1009;
 
+		inline void websocket_stream_expires_after(variant_stream_type& stream) const noexcept
+		{
+			if (m_option.websocket_timeout_ > 0)
+				stream_expires_after(stream, std::chrono::seconds(m_option.websocket_timeout_));
+		}
+
 		template<typename DynamicBuffer>
 		inline net::awaitable<bool>
 		read_exact_with_buffer(
@@ -2914,6 +2939,7 @@ R"x*x*x(<html>
 				co_return true;
 
 			boost::system::error_code ec;
+			websocket_stream_expires_after(from);
 			co_await net::async_read(
 				from,
 				net::buffer(out + copied, size - copied),
@@ -3110,6 +3136,7 @@ R"x*x*x(<html>
 		{
 			boost::system::error_code ec;
 			auto frame = make_websocket_close_frame(code, mask);
+			websocket_stream_expires_after(to);
 			co_await net::async_write(
 				to,
 				net::buffer(frame),
@@ -3180,6 +3207,7 @@ R"x*x*x(<html>
 					co_return false;
 
 				boost::system::error_code ec;
+				websocket_stream_expires_after(to);
 				co_await net::async_write(
 					to,
 					net::buffer(chunk.data(), chunk_size),
@@ -3243,6 +3271,7 @@ R"x*x*x(<html>
 				}
 
 				boost::system::error_code ec;
+				websocket_stream_expires_after(to);
 				co_await net::async_write(
 					to,
 					net::buffer(header.raw),
@@ -3539,6 +3568,15 @@ R"x*x*x(<html>
 				prepare_http_proxy_request(req, host, resource);
 
 				bool websocket_upgrade = is_http_proxy_websocket_upgrade(req);
+				if (websocket_upgrade && m_option.disable_websocket_)
+				{
+					log_conn_warning()
+						<< ", websocket upgrade disabled by config";
+
+					co_await forbidden_http_route(req);
+					co_return true;
+				}
+
 				if (websocket_upgrade && !validate_websocket_upgrade_request(req))
 				{
 					log_conn_warning()

@@ -206,3 +206,67 @@ Implemented details:
 - `CONNECT` behavior remains unchanged and still uses raw tunneling.
 - Absolute-form `wss://` over encrypted upstream proxy streams currently fails explicitly with `operation_not_supported` because nested TLS over the current `variant_stream_type` is not supported.
 - Build verification passed: `cmake --build build-local --target proxy_server -j 2`.
+
+## Next Work: WebSocket Configuration
+
+Requirement item 5 adds configuration knobs:
+
+- `disable_websocket`: fully disable WebSocket Upgrade handling.
+- `websocket_max_frame_size`: maximum accepted WebSocket frame payload size, default `65536`.
+- `websocket_ping_interval`: interval for proxy-generated ping frames, default `30` seconds.
+- `websocket_timeout`: idle timeout for WebSocket traffic.
+
+Current state:
+
+- `proxy_server_option::websocket_max_frame_size_` already exists and is used by frame validation, but it is not exposed through CLI/config yet.
+- `disable_websocket` does not exist yet.
+- `websocket_ping_interval` does not exist yet.
+- `websocket_timeout` does not exist yet.
+- Existing `tcp_timeout` is applied to generic TCP transfer paths, but WebSocket relay currently does not set per-read/per-write expiry in the frame loop.
+
+Design options:
+
+1. Minimal config plumbing:
+   - Add the four fields to `proxy_server_option`.
+   - Add globals and `boost::program_options` entries in `server/proxy_server/main.cpp`.
+   - Wire values into `opt`.
+   - `disable_websocket=true` rejects Upgrade requests with a normal HTTP error.
+   - `websocket_max_frame_size` controls the existing frame-size check.
+   - Treat `websocket_timeout` as WebSocket-specific stream expiry in frame reads/writes.
+   - Set `websocket_ping_interval=0` to disable proxy-generated ping until ping semantics are implemented.
+
+2. Full ping implementation in validating relay:
+   - Add a timer coroutine running alongside both relay directions.
+   - Send ping frames periodically to one or both peers.
+   - Track pong responses and close on missing pong/timeout.
+   - This requires the proxy to inject control frames into a transparent relay, which is legal but adds synchronization requirements because relay writes and timer writes share the same sockets.
+
+3. Endpoint-style WebSocket management:
+   - Terminate WebSocket sessions with Beast websocket streams.
+   - Use built-in ping/pong/timeout machinery.
+   - More invasive and conflicts with the chosen transparent frame-aware relay design.
+
+Preferred next step:
+
+- Implement option 1 now.
+- Expose all four config options.
+- Enforce `disable_websocket`, `websocket_max_frame_size`, and `websocket_timeout`.
+- Add `websocket_ping_interval` as a parsed/stored option but initially keep active ping injection disabled or only implement it after introducing serialized write guards.
+- Document that `0` disables ping/timeout where applicable.
+
+Status: implemented with the conservative option.
+
+Implemented details:
+
+- Added `disable_websocket_`, `websocket_ping_interval_`, and `websocket_timeout_` to `proxy_server_option`.
+- Exposed all four CLI/config options in `server/proxy_server/main.cpp`:
+  - `disable_websocket`, default `false`;
+  - `websocket_max_frame_size`, default `65536`;
+  - `websocket_ping_interval`, default `30`;
+  - `websocket_timeout`, default `-1`.
+- Wired CLI values into the runtime `proxy_server_option`.
+- `disable_websocket=true` now rejects HTTP proxy WebSocket Upgrade requests before connecting upstream.
+- `websocket_max_frame_size` now comes from CLI/config and continues to drive the existing frame payload validation.
+- `websocket_timeout > 0` refreshes stream expiry before WebSocket frame reads and writes.
+- `websocket_ping_interval` is parsed and stored, but active proxy-generated ping frames remain intentionally deferred until WebSocket writes are serialized through a single writer path.
+- Build verification passed: `cmake --build build-local --target proxy_server -j 2`.

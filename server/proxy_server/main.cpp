@@ -85,6 +85,7 @@ bool disable_insecure = true;
 bool disable_logs;
 bool disable_socks = false;
 bool disable_udp = false;
+bool disable_websocket = false;
 
 bool happyeyeballs = true;
 bool connect_v6only = false;
@@ -98,6 +99,9 @@ int64_t linux_so_mark;
 uint16_t noise_length;
 int tcp_timeout;
 int rate_limit;
+uint64_t websocket_max_frame_size;
+int websocket_ping_interval;
+int websocket_timeout;
 
 std::string asio_config;
 
@@ -246,11 +250,15 @@ start_proxy_server(net::io_context& ioc, server_ptr& server)
 	opt.disable_socks_ = disable_socks;
 	opt.disable_udp_ = disable_udp;
 	opt.disable_insecure_ = disable_insecure;
+	opt.disable_websocket_ = disable_websocket;
 	opt.scramble_ = scramble;
 	opt.noise_length_ = noise_length;
 	opt.local_ip_ = local_ip;
 	opt.tcp_timeout_ = tcp_timeout;
 	opt.tcp_rate_limit_ = rate_limit;
+	opt.websocket_max_frame_size_ = websocket_max_frame_size;
+	opt.websocket_ping_interval_ = websocket_ping_interval;
+	opt.websocket_timeout_ = websocket_timeout;
 
 	opt.ipip_db_ = ipip_db_name;
 	if (!deny_region.empty())
@@ -458,6 +466,10 @@ int main(int argc, char** argv)
 		("disable_socks", po::value<bool>(&disable_socks)->value_name("")->default_value(false, "false"), "Disable SOCKS proxy protocol.")
 		("disable_udp", po::value<bool>(&disable_udp)->value_name("")->default_value(false, "false"), "Disable UDP protocol.")
 		("disable_insecure", po::value<bool>(&disable_insecure)->value_name("")->default_value(false, "false"), "Disable insecure protocol.")
+		("disable_websocket", po::value<bool>(&disable_websocket)->value_name("")->default_value(false, "false"), "Disable WebSocket Upgrade support.")
+		("websocket_max_frame_size", po::value<uint64_t>(&websocket_max_frame_size)->value_name("bytes")->default_value(65536), "Set maximum WebSocket frame payload size in bytes.")
+		("websocket_ping_interval", po::value<int>(&websocket_ping_interval)->value_name("seconds")->default_value(30), "Set WebSocket ping interval in seconds (reserved, 0 disables proxy-generated pings).")
+		("websocket_timeout", po::value<int>(&websocket_timeout)->value_name("seconds")->default_value(-1), "Set WebSocket idle timeout in seconds (-1 or 0 disables).")
 
 		("scramble", po::value<bool>(&scramble)->value_name("")->default_value(false, "false"), "Noise-based data security.")
 		("noise_length", po::value<uint16_t>(&noise_length)->value_name("length")->default_value(0x0fff), "Length of the noise data.")
