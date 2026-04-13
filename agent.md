@@ -270,3 +270,85 @@ Implemented details:
 - `websocket_timeout > 0` refreshes stream expiry before WebSocket frame reads and writes.
 - `websocket_ping_interval` is parsed and stored, but active proxy-generated ping frames remain intentionally deferred until WebSocket writes are serialized through a single writer path.
 - Build verification passed: `cmake --build build-local --target proxy_server -j 2`.
+
+## Next Work: WebSocket Error Handling And Shutdown
+
+Requirement item 6 asks for correct close/error behavior:
+
+- send WebSocket Close frames with appropriate close codes when connections break;
+- close invalid WebSocket frames with code `1002` (`protocol error`);
+- close oversized frames with the correct size-limit behavior;
+- on server shutdown, send Close frames to all active WebSocket clients before closing sockets.
+
+Current state:
+
+- Invalid frame validation already maps to `websocket_close_protocol_error` (`1002`).
+- Oversized frame validation already maps to `websocket_close_message_too_big` (`1009`).
+- `close_websocket_peers(code)` already sends an unmasked Close frame toward the client side and a masked Close frame toward the upstream side.
+- A relayed Close frame from either peer is forwarded as normal data and then the corresponding relay direction stops.
+- Plain I/O errors, EOF, timeout-triggered operation aborts, and server shutdown currently tend to end by returning from the relay or by closing sockets, not by sending a WebSocket Close frame to the still-open peer.
+- `proxy_server::close()` calls `proxy_session::close()` for active sessions. `proxy_session::close()` is currently synchronous and closes both variant streams immediately.
+
+Known gaps:
+
+- The session does not track whether it is currently inside an established WebSocket relay.
+- `close()` cannot currently distinguish a WebSocket session from plain HTTP/SOCKS/TCP traffic.
+- Server shutdown cannot `co_await` from the current synchronous `close()` method.
+- Sending proactive Close frames from more than one coroutine can race with normal relay writes unless writes are coordinated or the shutdown path is carefully one-shot.
+- RFC code `1006` must not be sent on the wire, so abnormal TCP EOF should notify the opposite peer with another real code, most likely `1001` (`going away`) or `1002` if the EOF happens mid-frame/protocol violation.
+
+Candidate directions:
+
+1. Minimal patch:
+   - Add `m_websocket_active` to `proxy_session`.
+   - Set it when upstream returns `101` and clear it after `websocket_concurrent_transfer()` returns.
+   - On relay read/write I/O failure, call a small helper that sends `1001` to the opposite peer if it is still open.
+   - On `proxy_session::close()`, if `m_websocket_active` is true, spawn a best-effort coroutine to send `1001` and then close sockets.
+   - Lowest code churn, but there is still some risk of concurrent writes during shutdown.
+
+2. Stateful one-shot WebSocket closing:
+   - Add explicit WebSocket relay state to `proxy_session`: active flag, close-started flag, close reason, maybe close initiator.
+   - Create one helper such as `shutdown_websocket(code, send_to_client, send_to_upstream)` that is idempotent.
+   - Use it for protocol errors (`1002`), oversized frames (`1009`), I/O breakage (`1001`), and server shutdown (`1001`).
+   - Make `proxy_session::close()` spawn an async graceful close when WebSocket is active, and only force-close sockets after the Close frame attempt completes or fails.
+   - Medium complexity and best fit for the current transparent frame-aware relay.
+
+3. Full write-serialization layer:
+   - Introduce per-direction write queues/strands so relay writes, ping frames, and Close frames all go through one writer.
+   - Then implement ping interval, pong tracking, graceful shutdown, and close handshake on top of the same mechanism.
+   - Most correct long-term design, but it is larger and touches the architecture more deeply.
+
+4. Beast endpoint rewrite:
+   - Terminate both WebSocket sides as Beast websocket streams and let Beast manage close/ping/timeout behavior.
+   - High rewrite cost and conflicts with the chosen transparent relay approach.
+
+Preferred next step:
+
+- Implement direction 2.
+- Keep the frame-aware transparent relay, but add enough session state to make shutdown decisions explicit.
+- Preserve the already implemented `1002` and `1009` behavior.
+- Add `1001` (`going away`) for server shutdown and for peer disappearance where the opposite peer can still be notified.
+- Avoid sending `1006` because it is reserved and never sent in a Close frame payload.
+- Do not implement the full ping/write-queue machinery in this step, but design the close helper so it can later become the single WebSocket control-frame path.
+
+Status: implemented with direction 2.
+
+Implemented details:
+
+- Added WebSocket relay session state:
+  - `m_websocket_active`;
+  - `m_websocket_close_started`.
+- Added `websocket_close_going_away` (`1001`) for shutdown and peer-disappearance cases.
+- Replaced the older direct close helper with `shutdown_websocket(code, send_to_client, send_to_upstream, reason)`.
+- `shutdown_websocket()` is one-shot/idempotent:
+  - sends Close frames only once;
+  - sends unmasked Close frames toward the client side;
+  - sends masked Close frames toward the upstream side;
+  - then shuts down the open streams.
+- Protocol validation errors still close with `1002`.
+- Oversized frames still close with `1009`.
+- Header/payload read errors now notify the still-open opposite peer with `1001`.
+- Header/payload write errors now notify the source side with `1001`.
+- `proxy_session::close()` now detects active WebSocket relays and spawns a best-effort graceful WebSocket shutdown with `1001` instead of immediately closing sockets.
+- The full write-serialization layer is still intentionally deferred; this implementation keeps the current transparent relay model and makes Close handling one-shot to reduce duplicate/racing Close attempts.
+- Build verification passed: `cmake --build build-local --target proxy_server -j 2`.

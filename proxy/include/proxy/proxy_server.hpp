@@ -1173,6 +1173,22 @@ R"x*x*x(<html>
 
 			m_abort = true;
 
+			if (m_websocket_active && !m_websocket_close_started)
+			{
+				auto self = shared_from_this();
+				net::co_spawn(m_executor,
+					[this, self]() -> net::awaitable<void>
+					{
+						co_await shutdown_websocket(
+							websocket_close_going_away,
+							true,
+							true,
+							"server shutdown");
+					}, net::detached);
+
+				return;
+			}
+
 			boost::system::error_code ignore_ec;
 
 			// 关闭所有 socket.
@@ -2904,6 +2920,7 @@ R"x*x*x(<html>
 		static constexpr uint8_t websocket_opcode_ping = 0x9;
 		static constexpr uint8_t websocket_opcode_pong = 0xA;
 
+		static constexpr uint16_t websocket_close_going_away = 1001;
 		static constexpr uint16_t websocket_close_protocol_error = 1002;
 		static constexpr uint16_t websocket_close_message_too_big = 1009;
 
@@ -3151,26 +3168,47 @@ R"x*x*x(<html>
 		}
 
 		inline net::awaitable<void>
-		close_websocket_peers(uint16_t code) noexcept
+		shutdown_websocket(
+			uint16_t code,
+			bool send_to_client,
+			bool send_to_upstream,
+			std::string_view reason) noexcept
 		{
-			if (m_local_socket.is_open())
+			if (m_websocket_close_started)
+				co_return;
+
+			m_websocket_close_started = true;
+
+			log_conn_debug()
+				<< ", websocket shutdown"
+				<< ", code: " << code
+				<< ", reason: " << reason;
+
+			if (send_to_client && m_local_socket.is_open())
 				co_await send_websocket_close_frame(
 					m_local_socket,
 					code,
 					false,
 					"client");
 
-			if (m_remote_socket.is_open())
+			if (send_to_upstream && m_remote_socket.is_open())
 				co_await send_websocket_close_frame(
 					m_remote_socket,
 					code,
 					true,
 					"upstream");
 
+			m_abort = true;
+			m_websocket_active = false;
+
 			boost::system::error_code ec;
-			co_await async_shutdown(m_local_socket, net_awaitable[ec]);
-			ec.clear();
-			co_await async_shutdown(m_remote_socket, net_awaitable[ec]);
+			if (m_local_socket.is_open())
+			{
+				co_await async_shutdown(m_local_socket, net_awaitable[ec]);
+				ec.clear();
+			}
+			if (m_remote_socket.is_open())
+				co_await async_shutdown(m_remote_socket, net_awaitable[ec]);
 		}
 
 		inline uint16_t websocket_close_code(websocket_frame_error error) const noexcept
@@ -3186,6 +3224,7 @@ R"x*x*x(<html>
 			variant_stream_type& from,
 			variant_stream_type& to,
 			DynamicBuffer& prebuffer,
+			websocket_peer_role from_role,
 			uint64_t payload_length,
 			size_t& bytes_transferred,
 			std::string_view context) noexcept
@@ -3204,7 +3243,16 @@ R"x*x*x(<html>
 					chunk.data(),
 					chunk_size,
 					context))
+				{
+					const bool client_disappeared =
+						from_role == websocket_peer_role::client;
+					co_await shutdown_websocket(
+						websocket_close_going_away,
+						!client_disappeared,
+						client_disappeared,
+						"payload read error");
 					co_return false;
+				}
 
 				boost::system::error_code ec;
 				websocket_stream_expires_after(to);
@@ -3218,6 +3266,13 @@ R"x*x*x(<html>
 						<< ", websocket " << context
 						<< " payload async_write: "
 						<< ec.message();
+					const bool upstream_write_failed =
+						from_role == websocket_peer_role::client;
+					co_await shutdown_websocket(
+						websocket_close_going_away,
+						upstream_write_failed,
+						!upstream_write_failed,
+						"payload write error");
 					co_return false;
 				}
 
@@ -3249,7 +3304,16 @@ R"x*x*x(<html>
 					header,
 					context);
 				if (error == websocket_frame_error::io)
+				{
+					const bool client_disappeared =
+						from_role == websocket_peer_role::client;
+					co_await shutdown_websocket(
+						websocket_close_going_away,
+						!client_disappeared,
+						client_disappeared,
+						"header read error");
 					co_return;
+				}
 
 				if (error == websocket_frame_error::none)
 					error = validate_websocket_frame_header(
@@ -3266,7 +3330,11 @@ R"x*x*x(<html>
 						<< ", payload_length: "
 						<< header.payload_length;
 
-					co_await close_websocket_peers(websocket_close_code(error));
+					co_await shutdown_websocket(
+						websocket_close_code(error),
+						true,
+						true,
+						"invalid frame");
 					co_return;
 				}
 
@@ -3282,6 +3350,13 @@ R"x*x*x(<html>
 						<< ", websocket " << context
 						<< " header async_write: "
 						<< ec.message();
+					const bool upstream_write_failed =
+						from_role == websocket_peer_role::client;
+					co_await shutdown_websocket(
+						websocket_close_going_away,
+						upstream_write_failed,
+						!upstream_write_failed,
+						"header write error");
 					co_return;
 				}
 
@@ -3291,6 +3366,7 @@ R"x*x*x(<html>
 					from,
 					to,
 					prebuffer,
+					from_role,
 					header.payload_length,
 					bytes_transferred,
 					context))
@@ -3426,7 +3502,12 @@ R"x*x*x(<html>
 			log_conn_debug()
 				<< ", websocket upgrade established";
 
+			m_websocket_active = true;
+			m_websocket_close_started = false;
+
 			co_await websocket_concurrent_transfer(m_local_buffer, remote_buffer);
+
+			m_websocket_active = false;
 
 			co_return true;
 		}
@@ -5912,6 +5993,10 @@ R"x*x*x(<html>
 
 		// 当前 session 是否被中止的状态.
 		bool m_abort{ false };
+
+		// WebSocket relay state for graceful close/error handling.
+		bool m_websocket_active{ false };
+		bool m_websocket_close_started{ false };
 	};
 
 
